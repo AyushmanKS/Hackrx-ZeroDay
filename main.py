@@ -1,6 +1,6 @@
 import os
 import requests
-import asyncio # <-- Import asyncio
+import asyncio
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -16,6 +16,7 @@ from langchain_community.document_loaders import PyPDFLoader
 # --- Configuration ---
 HACKRX_TOKEN = "ed219fa46cac4026e20b9562bdfeecd13373a1e0a7529dee5b196421a3d97d4d"
 PDF_STORAGE_PATH = "policy.pdf"
+CONCURRENCY_LIMIT = 4 # Set a safe limit for concurrent API calls
 
 # --- API Models ---
 class HackRxRequest(BaseModel):
@@ -37,7 +38,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme
 
 # --- Core Logic ---
 def create_retrieval_qa_chain(pdf_path: str):
-    # This part doesn't need to be async, it runs once per request.
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
@@ -45,12 +45,18 @@ def create_retrieval_qa_chain(pdf_path: str):
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vector_store = FAISS.from_documents(texts, embeddings)
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, convert_system_message_to_human=True)
-    retriever = vector_store.as_retriever(search_kwargs={'k': 5})
-    # IMPORTANT: The chain now supports asynchronous calls with .ainvoke
     qa_chain = RetrievalQA.from_chain_type(
-        llm=llm, chain_type="stuff", retriever=retriever, return_source_documents=False
+        llm=llm, chain_type="stuff", retriever=vector_store.as_retriever(search_kwargs={'k': 5})
     )
     return qa_chain
+
+# Helper function to process a single question with the semaphore
+async def process_question_with_semaphore(qa_chain, question, semaphore):
+    async with semaphore: # This will wait if the semaphore is full (4 requests are active)
+        result = await qa_chain.ainvoke({"query": question})
+        # Adding a tiny delay can also help prevent bursting the limit
+        await asyncio.sleep(1) 
+        return result
 
 # --- API Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
@@ -69,18 +75,14 @@ async def run_submission(req: HackRxRequest, token: str = Depends(verify_token))
 
         qa_chain = create_retrieval_qa_chain(PDF_STORAGE_PATH)
 
-        # --- ASYNCHRONOUS QUESTION PROCESSING ---
-        # 1. Create a list of asynchronous tasks. .ainvoke is the async version of .invoke
-        tasks = [qa_chain.ainvoke({"query": q}) for q in questions]
+        # --- CONTROLLED CONCURRENCY WITH SEMAPHORE ---
+        semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        tasks = [process_question_with_semaphore(qa_chain, q, semaphore) for q in questions]
         
-        # 2. Run all tasks concurrently and wait for them all to complete.
         results = await asyncio.gather(*tasks)
-        
-        # 3. Extract the answer text from each result.
         answers = [res["result"] for res in results]
         
     except Exception as e:
-        # It's useful to print the error to the log for debugging
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
     finally:
