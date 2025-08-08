@@ -1,5 +1,6 @@
 import os
 import requests
+import asyncio # <-- Import asyncio
 from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -36,76 +37,55 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(auth_scheme
 
 # --- Core Logic ---
 def create_retrieval_qa_chain(pdf_path: str):
-    print("--- Inside create_retrieval_qa_chain ---")
-    
-    # 1. Load the document
-    print("[DEBUG] Step 1: Loading PDF with PyPDFLoader...")
+    # This part doesn't need to be async, it runs once per request.
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
-    print("[DEBUG] PDF loaded successfully.")
-
-    # 2. Split the document into chunks
-    print("[DEBUG] Step 2: Splitting documents into chunks...")
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     texts = text_splitter.split_documents(documents)
-    print(f"[DEBUG] Document split into {len(texts)} chunks.")
-
-    # 3. Create embeddings and vector store (FAISS)
-    print("[DEBUG] Step 3: Creating embeddings and FAISS index... (This is the most memory-intensive step)")
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
     vector_store = FAISS.from_documents(texts, embeddings)
-    print("[DEBUG] FAISS index created successfully.")
-
-    # 4. Create the Google Gemini LLM and the QA chain
-    print("[DEBUG] Step 4: Creating the QA Chain with Gemini...")
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, convert_system_message_to_human=True)
-    
     retriever = vector_store.as_retriever(search_kwargs={'k': 5})
+    # IMPORTANT: The chain now supports asynchronous calls with .ainvoke
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm, chain_type="stuff", retriever=retriever, return_source_documents=False
     )
-    print("[DEBUG] QA Chain created successfully.")
-    print("--- Chain creation complete. ---")
     return qa_chain
 
 # --- API Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
 async def run_submission(req: HackRxRequest, token: str = Depends(verify_token)):
-    print("\n--- Received new request ---")
     if not os.environ.get("GOOGLE_API_KEY"):
-        print("[ERROR] GOOGLE_API_KEY not found!")
         raise HTTPException(status_code=500, detail="GOOGLE_API_KEY environment variable not set.")
     
-    print("[DEBUG] GOOGLE_API_KEY found.")
     document_url = req.documents
     questions = req.questions
     
     try:
-        print(f"[DEBUG] Downloading document from: {document_url}")
         response = requests.get(document_url)
         response.raise_for_status()
-        
         with open(PDF_STORAGE_PATH, 'wb') as f:
             f.write(response.content)
-        print("[DEBUG] Document downloaded and saved.")
 
         qa_chain = create_retrieval_qa_chain(PDF_STORAGE_PATH)
 
-        answers = []
-        print(f"[DEBUG] Starting to process {len(questions)} questions...")
-        for i, question in enumerate(questions):
-            print(f"[DEBUG] Processing question {i+1}: {question}")
-            result = qa_chain.invoke({"query": question})
-            answers.append(result["result"])
-            print(f"[DEBUG] Answer for question {i+1} generated.")
-            
+        # --- ASYNCHRONOUS QUESTION PROCESSING ---
+        # 1. Create a list of asynchronous tasks. .ainvoke is the async version of .invoke
+        tasks = [qa_chain.ainvoke({"query": q}) for q in questions]
+        
+        # 2. Run all tasks concurrently and wait for them all to complete.
+        results = await asyncio.gather(*tasks)
+        
+        # 3. Extract the answer text from each result.
+        answers = [res["result"] for res in results]
+        
     except Exception as e:
+        # It's useful to print the error to the log for debugging
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
     finally:
         if os.path.exists(PDF_STORAGE_PATH):
             os.remove(PDF_STORAGE_PATH)
-        print("--- Request finished. ---")
 
     return HackRxResponse(answers=answers)
 
