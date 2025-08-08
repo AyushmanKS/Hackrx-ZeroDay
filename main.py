@@ -16,7 +16,8 @@ from langchain_community.document_loaders import PyPDFLoader
 # --- Configuration ---
 HACKRX_TOKEN = "ed219fa46cac4026e20b9562bdfeecd13373a1e0a7529dee5b196421a3d97d4d"
 PDF_STORAGE_PATH = "policy.pdf"
-CONCURRENCY_LIMIT = 4 # Set a safe limit for concurrent API calls
+# We need to stay under 60 requests per minute. 1.1 seconds per request is safe.
+REQUEST_DELAY = 1.1 
 
 # --- API Models ---
 class HackRxRequest(BaseModel):
@@ -50,14 +51,6 @@ def create_retrieval_qa_chain(pdf_path: str):
     )
     return qa_chain
 
-# Helper function to process a single question with the semaphore
-async def process_question_with_semaphore(qa_chain, question, semaphore):
-    async with semaphore: # This will wait if the semaphore is full (4 requests are active)
-        result = await qa_chain.ainvoke({"query": question})
-        # Adding a tiny delay can also help prevent bursting the limit
-        await asyncio.sleep(1) 
-        return result
-
 # --- API Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
 async def run_submission(req: HackRxRequest, token: str = Depends(verify_token)):
@@ -75,12 +68,13 @@ async def run_submission(req: HackRxRequest, token: str = Depends(verify_token))
 
         qa_chain = create_retrieval_qa_chain(PDF_STORAGE_PATH)
 
-        # --- CONTROLLED CONCURRENCY WITH SEMAPHORE ---
-        semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-        tasks = [process_question_with_semaphore(qa_chain, q, semaphore) for q in questions]
-        
-        results = await asyncio.gather(*tasks)
-        answers = [res["result"] for res in results]
+        # --- SEQUENTIAL PROCESSING WITH DELAY ---
+        # This is the most reliable way to avoid rate limits on strict free tiers.
+        answers = []
+        for question in questions:
+            result = await qa_chain.ainvoke({"query": question})
+            answers.append(result["result"])
+            await asyncio.sleep(REQUEST_DELAY) # Wait before making the next call
         
     except Exception as e:
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
