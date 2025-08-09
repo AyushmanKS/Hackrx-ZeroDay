@@ -12,13 +12,11 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.storage import InMemoryStore
-from langchain.retrievers import ParentDocumentRetriever
 
 # --- Configuration ---
 PDF_STORAGE_PATH = "policy.pdf"
 CHAIN_CACHE: Dict[str, RetrievalQA] = {}
-CONCURRENCY_LIMIT = 3 # A safe number of concurrent requests
+CONCURRENCY_LIMIT = 3 # A safe number of concurrent requests to avoid rate limits
 
 # --- API Models ---
 class HackRxRequest(BaseModel):
@@ -33,13 +31,11 @@ app = FastAPI()
 
 # --- Core Logic ---
 
-PROMPT_V_FINAL = """
-You are an AI Policy Adjudicator. Your task is to act as an expert and provide a definitive answer to a question about a policy document based *exclusively* on the provided context.
-The context may contain multiple, sometimes conflicting, clauses. Your job is to synthesize them.
-1.  Read all context excerpts carefully.
-2.  Form a comprehensive answer. If there are conflicting clauses (e.g., a general coverage and a specific exclusion), prioritize the most specific clause to make a final judgment.
-3.  Provide a direct, factual answer to the question.
-4.  If, and only if, the information to answer the question is not present in the context, state: "The answer to this question could not be determined from the provided document excerpts."
+PROMPT_V_EXPERT = """
+You are an AI expert specializing in insurance policy analysis. Your task is to provide a clear and accurate answer based *exclusively* on the provided text excerpts from a policy document.
+Use the following context to answer the user's question. Synthesize the information from all provided chunks to form a complete answer.
+If the information is present, provide a direct and factual answer.
+If the context does not contain the answer, state: "The answer to this question could not be determined from the provided document excerpts."
 
 Context:
 {context}
@@ -47,19 +43,19 @@ Context:
 Question:
 {question}
 
-Definitive Answer:
+Factual and Precise Answer:
 """
 
 def create_and_cache_qa_chain(doc_url: str):
     """
-    Creates the definitive balanced QA chain and caches it.
-    Uses Parent Document Retriever for rich context.
+    Creates a simple, robust QA chain and caches it.
+    Uses a standard retriever with a larger context window.
     """
     if doc_url in CHAIN_CACHE:
         print(f"[INFO] Using cached QA chain for document: {doc_url}")
         return CHAIN_CACHE[doc_url]
 
-    print(f"[INFO] New document. Creating definitive QA chain for: {doc_url}")
+    print(f"[INFO] New document. Creating simple & robust QA chain for: {doc_url}")
     
     response = requests.get(doc_url)
     response.raise_for_status()
@@ -69,32 +65,34 @@ def create_and_cache_qa_chain(doc_url: str):
     loader = PyPDFLoader(PDF_STORAGE_PATH)
     docs = loader.load()
 
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
-    vectorstore = FAISS.from_documents(docs, embedding=GoogleGenerativeAIEmbeddings(model="models/embedding-001"))
-    store = InMemoryStore()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    texts = text_splitter.split_documents(docs)
     
-    retriever = ParentDocumentRetriever(
-        vectorstore=vectorstore, docstore=store, child_splitter=child_splitter, parent_splitter=parent_splitter
-    )
-    retriever.add_documents(docs)
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vectorstore = FAISS.from_documents(texts, embeddings)
 
-    # THE CRITICAL BUG FIX: Explicitly disable LangChain's automatic retries.
+    # Use a basic retriever but fetch more documents (k=8) for better context.
+    retriever = vectorstore.as_retriever(search_kwargs={'k': 8})
+
+    # Critically, disable LangChain's automatic retries to prevent retry storms.
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash", 
         temperature=0,
-        max_retries=0 # Try only once. Prevents the retry storm.
+        max_retries=0 # Try only once.
     )
     
-    prompt = PromptTemplate(template=PROMPT_V_FINAL, input_variables=["context", "question"])
+    prompt = PromptTemplate(template=PROMPT_V_EXPERT, input_variables=["context", "question"])
     chain_type_kwargs = {"prompt": prompt}
 
     qa_chain = RetrievalQA.from_chain_type(
-        llm=llm, chain_type="stuff", retriever=retriever, chain_type_kwargs=chain_type_kwargs
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs=chain_type_kwargs
     )
     
     CHAIN_CACHE[doc_url] = qa_chain
-    print(f"[INFO] Definitive QA chain for {doc_url} created and cached.")
+    print(f"[INFO] Simple & robust QA chain for {doc_url} created and cached.")
     
     if os.path.exists(PDF_STORAGE_PATH):
         os.remove(PDF_STORAGE_PATH)
@@ -103,8 +101,8 @@ def create_and_cache_qa_chain(doc_url: str):
 
 async def process_question_with_semaphore(qa_chain, question, semaphore):
     async with semaphore:
-        # A small delay *before* the call helps prevent bursting the API limit
-        await asyncio.sleep(0.5) 
+        # A tiny delay helps smooth out the initial burst of requests
+        await asyncio.sleep(0.2)
         return await qa_chain.ainvoke({"query": question})
 
 # --- API Endpoint ---
@@ -124,11 +122,10 @@ async def run_submission(req: HackRxRequest):
             
     except Exception as e:
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
-        # Return a more informative error message to Postman
         raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
     return HackRxResponse(answers=answers)
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running the final, stable version."}
+    return {"status": "API is running the definitive version for Level 2."}
