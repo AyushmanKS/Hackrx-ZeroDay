@@ -5,19 +5,19 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import List, Dict
 
-# LangChain components for the advanced solution
+# LangChain components
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.storage import InMemoryStore
-from langchain.retrievers import ParentDocumentRetriever, HydeRetriever
 
 # --- Configuration ---
+HACKRX_TOKEN = "ed219fa46cac4026e20b9562bdfeecd13373a1e0a7529dee5b196421a3d97d4d"
 PDF_STORAGE_PATH = "policy.pdf"
 CHAIN_CACHE: Dict[str, RetrievalQA] = {}
+REQUEST_DELAY = 1.1 
 
 # --- API Models ---
 class HackRxRequest(BaseModel):
@@ -32,9 +32,12 @@ app = FastAPI()
 
 # --- Core Logic ---
 
+# Refined "Expert" Prompt
 PROMPT_V_EXPERT = """
 You are an AI expert specializing in insurance policy analysis. Your task is to provide clear and accurate answers based *exclusively* on the provided text excerpts from a policy document.
+
 Use the following context to answer the user's question. Synthesize the information from all provided chunks to form a complete answer.
+
 If the information is present, provide a direct and factual answer.
 If the context does not contain the answer, state: "A clear answer to this question could not be found in the provided document excerpts."
 
@@ -49,14 +52,13 @@ Factual and Precise Answer:
 
 def create_and_cache_qa_chain(doc_url: str):
     """
-    Creates the definitive high-accuracy/high-performance QA chain and caches it.
-    Uses Parent Document Retriever for context and HyDE for retrieval accuracy.
+    Creates a high-accuracy QA chain using smaller chunks and MMR search.
     """
     if doc_url in CHAIN_CACHE:
         print(f"[INFO] Using cached QA chain for document: {doc_url}")
         return CHAIN_CACHE[doc_url]
 
-    print(f"[INFO] New document. Creating definitive QA chain for: {doc_url}")
+    print(f"[INFO] New document. Creating optimized QA chain for: {doc_url}")
     
     response = requests.get(doc_url)
     response.raise_for_status()
@@ -64,49 +66,38 @@ def create_and_cache_qa_chain(doc_url: str):
         f.write(response.content)
     
     loader = PyPDFLoader(PDF_STORAGE_PATH)
-    docs = loader.load()
+    documents = loader.load()
 
-    # --- ADVANCED RETRIEVAL SETUP ---
-
-    # 1. Parent Document Retriever Setup
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
-    vectorstore = FAISS.from_documents(docs, embedding=GoogleGenerativeAIEmbeddings(model="models/embedding-001")) # Temporary store for setup
-    store = InMemoryStore()
+    # STRATEGY 1: Smaller, more granular chunks
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    texts = text_splitter.split_documents(documents)
+    print(f"[INFO] Document split into {len(texts)} smaller chunks.")
     
-    parent_document_retriever = ParentDocumentRetriever(
-        vectorstore=vectorstore,
-        docstore=store,
-        child_splitter=child_splitter,
-        parent_splitter=parent_splitter,
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vector_store = FAISS.from_documents(texts, embeddings)
+
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+    
+    # STRATEGY 2: Use Maximal Marginal Relevance (MMR) search
+    retriever = vector_store.as_retriever(
+        search_type="mmr",
+        search_kwargs={'k': 8, 'fetch_k': 20} # Fetch 20 docs, then use MMR to pick the best 8.
     )
-    parent_document_retriever.add_documents(docs)
-
-    # 2. HyDE (Hypothetical Document Embeddings) Retriever Setup
-    llm_for_hyde = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-    embeddings_for_hyde = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-
-    hyde_retriever = HydeRetriever(
-        retriever=parent_document_retriever,
-        llm=llm_for_hyde,
-        prompt_key="query" # Pass the question to the LLM
-    )
-
-    # 3. Final QA Chain Assembly
-    llm_for_qa = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
+    
+    # STRATEGY 3: Use the refined expert prompt
     prompt = PromptTemplate(template=PROMPT_V_EXPERT, input_variables=["context", "question"])
     chain_type_kwargs = {"prompt": prompt}
 
     qa_chain = RetrievalQA.from_chain_type(
-        llm=llm_for_qa,
+        llm=llm,
         chain_type="stuff",
-        retriever=hyde_retriever,
+        retriever=retriever,
         chain_type_kwargs=chain_type_kwargs,
         return_source_documents=False
     )
     
     CHAIN_CACHE[doc_url] = qa_chain
-    print(f"[INFO] Definitive QA chain for {doc_url} created and cached.")
+    print(f"[INFO] Optimized QA chain for {doc_url} created and cached.")
     
     if os.path.exists(PDF_STORAGE_PATH):
         os.remove(PDF_STORAGE_PATH)
@@ -122,12 +113,11 @@ async def run_submission(req: HackRxRequest):
     try:
         qa_chain = create_and_cache_qa_chain(req.documents)
         
-        # TECHNIQUE 1: Batch processing for maximum speed
-        # Create a list of inputs for the batch call
-        batch_inputs = [{"query": q} for q in req.questions]
-        results = await qa_chain.abatch(batch_inputs)
-        
-        answers = [res["result"] for res in results]
+        answers = []
+        for question in req.questions:
+            result = await qa_chain.ainvoke({"query": question})
+            answers.append(result["result"])
+            await asyncio.sleep(REQUEST_DELAY)
             
     except Exception as e:
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
@@ -137,4 +127,4 @@ async def run_submission(req: HackRxRequest):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running with advanced accuracy and performance enhancements."}
+    return {"status": "API is running with Level 2 accuracy enhancements."}
