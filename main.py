@@ -1,7 +1,7 @@
 import os
 import requests
 import asyncio
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict
 
@@ -18,7 +18,7 @@ from langchain.retrievers import ParentDocumentRetriever
 # --- Configuration ---
 PDF_STORAGE_PATH = "policy.pdf"
 CHAIN_CACHE: Dict[str, RetrievalQA] = {}
-CONCURRENCY_LIMIT = 3 # A safe number of concurrent requests to avoid rate limits
+CONCURRENCY_LIMIT = 3 # A safe number of concurrent requests
 
 # --- API Models ---
 class HackRxRequest(BaseModel):
@@ -33,7 +33,6 @@ app = FastAPI()
 
 # --- Core Logic ---
 
-# THE ADJUDICATOR PROMPT: Our definitive prompt for resolving ambiguity.
 PROMPT_V_FINAL = """
 You are an AI Policy Adjudicator. Your task is to act as an expert and provide a definitive answer to a question about a policy document based *exclusively* on the provided context.
 The context may contain multiple, sometimes conflicting, clauses. Your job is to synthesize them.
@@ -70,35 +69,28 @@ def create_and_cache_qa_chain(doc_url: str):
     loader = PyPDFLoader(PDF_STORAGE_PATH)
     docs = loader.load()
 
-    # ACCURACY FIX: Use ParentDocumentRetriever for the best context.
-    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
     vectorstore = FAISS.from_documents(docs, embedding=GoogleGenerativeAIEmbeddings(model="models/embedding-001"))
     store = InMemoryStore()
     
     retriever = ParentDocumentRetriever(
-        vectorstore=vectorstore,
-        docstore=store,
-        child_splitter=child_splitter,
-        parent_splitter=parent_splitter,
+        vectorstore=vectorstore, docstore=store, child_splitter=child_splitter, parent_splitter=parent_splitter
     )
     retriever.add_documents(docs)
 
-    # LATENCY FIX: Crucially, disable LangChain's automatic retries.
+    # THE CRITICAL BUG FIX: Explicitly disable LangChain's automatic retries.
     llm = ChatGoogleGenerativeAI(
         model="gemini-1.5-flash", 
         temperature=0,
-        max_retries=0 # Try once, then fail. Our semaphore will handle it.
+        max_retries=0 # Try only once. Prevents the retry storm.
     )
     
     prompt = PromptTemplate(template=PROMPT_V_FINAL, input_variables=["context", "question"])
     chain_type_kwargs = {"prompt": prompt}
 
     qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs=chain_type_kwargs
+        llm=llm, chain_type="stuff", retriever=retriever, chain_type_kwargs=chain_type_kwargs
     )
     
     CHAIN_CACHE[doc_url] = qa_chain
@@ -109,9 +101,10 @@ def create_and_cache_qa_chain(doc_url: str):
         
     return qa_chain
 
-# Helper function for our controlled concurrency
 async def process_question_with_semaphore(qa_chain, question, semaphore):
     async with semaphore:
+        # A small delay *before* the call helps prevent bursting the API limit
+        await asyncio.sleep(0.5) 
         return await qa_chain.ainvoke({"query": question})
 
 # --- API Endpoint ---
@@ -123,7 +116,6 @@ async def run_submission(req: HackRxRequest):
     try:
         qa_chain = create_and_cache_qa_chain(req.documents)
         
-        # LATENCY FIX: Use a semaphore for controlled concurrent requests.
         semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
         tasks = [process_question_with_semaphore(qa_chain, q, semaphore) for q in req.questions]
         
@@ -132,10 +124,11 @@ async def run_submission(req: HackRxRequest):
             
     except Exception as e:
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+        # Return a more informative error message to Postman
+        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
 
     return HackRxResponse(answers=answers)
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running the definitive version for Level 2."}
+    return {"status": "API is running the final, stable version."}
