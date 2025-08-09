@@ -12,12 +12,13 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain_community.document_loaders import PyPDFLoader
+from langchain.storage import InMemoryStore
+from langchain.retrievers import ParentDocumentRetriever
 
 # --- Configuration ---
-HACKRX_TOKEN = "ed219fa46cac4026e20b9562bdfeecd13373a1e0a7529dee5b196421a3d97d4d"
 PDF_STORAGE_PATH = "policy.pdf"
 CHAIN_CACHE: Dict[str, RetrievalQA] = {}
-REQUEST_DELAY = 1.1 
+CONCURRENCY_LIMIT = 3 # A safe number of concurrent requests to avoid rate limits
 
 # --- API Models ---
 class HackRxRequest(BaseModel):
@@ -32,14 +33,14 @@ app = FastAPI()
 
 # --- Core Logic ---
 
-# Refined "Expert" Prompt
-PROMPT_V_EXPERT = """
-You are an AI expert specializing in insurance policy analysis. Your task is to provide clear and accurate answers based *exclusively* on the provided text excerpts from a policy document.
-
-Use the following context to answer the user's question. Synthesize the information from all provided chunks to form a complete answer.
-
-If the information is present, provide a direct and factual answer.
-If the context does not contain the answer, state: "A clear answer to this question could not be found in the provided document excerpts."
+# THE ADJUDICATOR PROMPT: Our definitive prompt for resolving ambiguity.
+PROMPT_V_FINAL = """
+You are an AI Policy Adjudicator. Your task is to act as an expert and provide a definitive answer to a question about a policy document based *exclusively* on the provided context.
+The context may contain multiple, sometimes conflicting, clauses. Your job is to synthesize them.
+1.  Read all context excerpts carefully.
+2.  Form a comprehensive answer. If there are conflicting clauses (e.g., a general coverage and a specific exclusion), prioritize the most specific clause to make a final judgment.
+3.  Provide a direct, factual answer to the question.
+4.  If, and only if, the information to answer the question is not present in the context, state: "The answer to this question could not be determined from the provided document excerpts."
 
 Context:
 {context}
@@ -47,18 +48,19 @@ Context:
 Question:
 {question}
 
-Factual and Precise Answer:
+Definitive Answer:
 """
 
 def create_and_cache_qa_chain(doc_url: str):
     """
-    Creates a high-accuracy QA chain using smaller chunks and MMR search.
+    Creates the definitive balanced QA chain and caches it.
+    Uses Parent Document Retriever for rich context.
     """
     if doc_url in CHAIN_CACHE:
         print(f"[INFO] Using cached QA chain for document: {doc_url}")
         return CHAIN_CACHE[doc_url]
 
-    print(f"[INFO] New document. Creating optimized QA chain for: {doc_url}")
+    print(f"[INFO] New document. Creating definitive QA chain for: {doc_url}")
     
     response = requests.get(doc_url)
     response.raise_for_status()
@@ -66,43 +68,51 @@ def create_and_cache_qa_chain(doc_url: str):
         f.write(response.content)
     
     loader = PyPDFLoader(PDF_STORAGE_PATH)
-    documents = loader.load()
+    docs = loader.load()
 
-    # STRATEGY 1: Smaller, more granular chunks
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    texts = text_splitter.split_documents(documents)
-    print(f"[INFO] Document split into {len(texts)} smaller chunks.")
+    # ACCURACY FIX: Use ParentDocumentRetriever for the best context.
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000)
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=400)
+    vectorstore = FAISS.from_documents(docs, embedding=GoogleGenerativeAIEmbeddings(model="models/embedding-001"))
+    store = InMemoryStore()
     
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vector_store = FAISS.from_documents(texts, embeddings)
+    retriever = ParentDocumentRetriever(
+        vectorstore=vectorstore,
+        docstore=store,
+        child_splitter=child_splitter,
+        parent_splitter=parent_splitter,
+    )
+    retriever.add_documents(docs)
 
-    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0)
-    
-    # STRATEGY 2: Use Maximal Marginal Relevance (MMR) search
-    retriever = vector_store.as_retriever(
-        search_type="mmr",
-        search_kwargs={'k': 8, 'fetch_k': 20} # Fetch 20 docs, then use MMR to pick the best 8.
+    # LATENCY FIX: Crucially, disable LangChain's automatic retries.
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash", 
+        temperature=0,
+        max_retries=0 # Try once, then fail. Our semaphore will handle it.
     )
     
-    # STRATEGY 3: Use the refined expert prompt
-    prompt = PromptTemplate(template=PROMPT_V_EXPERT, input_variables=["context", "question"])
+    prompt = PromptTemplate(template=PROMPT_V_FINAL, input_variables=["context", "question"])
     chain_type_kwargs = {"prompt": prompt}
 
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=retriever,
-        chain_type_kwargs=chain_type_kwargs,
-        return_source_documents=False
+        chain_type_kwargs=chain_type_kwargs
     )
     
     CHAIN_CACHE[doc_url] = qa_chain
-    print(f"[INFO] Optimized QA chain for {doc_url} created and cached.")
+    print(f"[INFO] Definitive QA chain for {doc_url} created and cached.")
     
     if os.path.exists(PDF_STORAGE_PATH):
         os.remove(PDF_STORAGE_PATH)
         
     return qa_chain
+
+# Helper function for our controlled concurrency
+async def process_question_with_semaphore(qa_chain, question, semaphore):
+    async with semaphore:
+        return await qa_chain.ainvoke({"query": question})
 
 # --- API Endpoint ---
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
@@ -113,11 +123,12 @@ async def run_submission(req: HackRxRequest):
     try:
         qa_chain = create_and_cache_qa_chain(req.documents)
         
-        answers = []
-        for question in req.questions:
-            result = await qa_chain.ainvoke({"query": question})
-            answers.append(result["result"])
-            await asyncio.sleep(REQUEST_DELAY)
+        # LATENCY FIX: Use a semaphore for controlled concurrent requests.
+        semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        tasks = [process_question_with_semaphore(qa_chain, q, semaphore) for q in req.questions]
+        
+        results = await asyncio.gather(*tasks)
+        answers = [res["result"] for res in results]
             
     except Exception as e:
         print(f"[CRITICAL ERROR] An exception occurred: {e}")
@@ -127,4 +138,4 @@ async def run_submission(req: HackRxRequest):
 
 @app.get("/")
 def read_root():
-    return {"status": "API is running with Level 2 accuracy enhancements."}
+    return {"status": "API is running the definitive version for Level 2."}
